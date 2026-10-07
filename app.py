@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -18,7 +19,11 @@ from pypdf import PdfReader
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
-DEFAULT_MODEL = "gemini-3.8-flash"  # change in secrets (GEMINI_MODEL) if needed
+DEFAULT_MODEL = "gemini-3.5-flash"  # change in secrets (GEMINI_MODEL) if needed
+# Used automatically if the main model is overloaded (override with GEMINI_FALLBACK_MODELS, comma-separated)
+DEFAULT_FALLBACKS = "gemini-3.5-flash-lite,gemini-flash-latest"
+RETRIES_PER_MODEL = 3  # attempts per model before moving to the next one
+BACKOFF_SECONDS = 2  # waits 2s, 4s, ... between attempts
 MAX_RESUME_CHARS = 15000
 MAX_JD_CHARS = 6000
 MIN_RESUME_CHARS = 150
@@ -227,23 +232,49 @@ def build_prompt(resume_text: str, job_description: str) -> str:
     )
 
 
-def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
+def is_transient_error(err: Exception) -> bool:
+    """True for temporary Google-side problems worth retrying (overload, rate limit, timeout)."""
+    msg = str(err).upper()
+    markers = ("503", "UNAVAILABLE", "OVERLOAD", "HIGH DEMAND", "500", "INTERNAL",
+               "504", "DEADLINE", "429", "RESOURCE_EXHAUSTED", "TIMEOUT", "TIMED OUT")
+    return any(m in msg for m in markers)
+
+
+def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str,
+                   fallback_models=None, sleep=time.sleep) -> dict:
+    """Call Gemini with retries (exponential backoff) and fallback models on temporary errors."""
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=build_prompt(resume_text, job_description),
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
-    )
-    return normalize_result(parse_json_response(response.text))
+    prompt = build_prompt(resume_text, job_description)
+    config = types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json")
+
+    models = [model] + [m for m in (fallback_models or []) if m and m != model]
+    last_error = None
+    for current in models:
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                response = client.models.generate_content(model=current, contents=prompt, config=config)
+                result = normalize_result(parse_json_response(response.text))
+                result["model_used"] = current
+                return result
+            except ValueError as e:  # unreadable JSON: one more try is usually enough
+                last_error = e
+                if attempt == RETRIES_PER_MODEL - 1:
+                    break
+                sleep(1)
+            except Exception as e:
+                last_error = e
+                if not is_transient_error(e):
+                    raise  # bad key, bad request, etc. - retrying won't help
+                if attempt < RETRIES_PER_MODEL - 1:
+                    sleep(BACKOFF_SECONDS * (2 ** attempt))
+        # this model is exhausted -> try the next one
+    raise last_error
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def cached_analysis(resume_text: str, job_description: str, model: str, _api_key: str) -> dict:
+def cached_analysis(resume_text: str, job_description: str, model: str, fallbacks: tuple, _api_key: str) -> dict:
     """Cache results so re-clicking with the same inputs doesn't use API quota."""
-    return analyze_resume(_api_key, model, resume_text, job_description)
+    return analyze_resume(_api_key, model, resume_text, job_description, list(fallbacks))
 
 
 # ----------------------------------------------------------------------------
@@ -265,6 +296,8 @@ def score_verdict(score: int) -> str:
 
 def render_results(result: dict) -> None:
     overall = result["overall"]
+    if result.get("model_used"):
+        st.caption(f"Analyzed with {result['model_used']}")
 
     left, right = st.columns([1, 2])
     with left:
@@ -390,7 +423,8 @@ def main() -> None:
                 return
 
             with st.spinner("Analyzing with Gemini..."):
-                result = cached_analysis(resume_text, job_description, model.strip(), api_key)
+                fallbacks = tuple(m.strip() for m in get_secret("GEMINI_FALLBACK_MODELS", DEFAULT_FALLBACKS).split(",") if m.strip())
+                result = cached_analysis(resume_text, job_description, model.strip(), fallbacks, api_key)
 
             st.session_state["result"] = result
             st.session_state["resume_text"] = resume_text
@@ -401,6 +435,9 @@ def main() -> None:
             msg = str(e)
             if "API key" in msg or "API_KEY" in msg or "PERMISSION_DENIED" in msg:
                 st.error("Invalid or unauthorized Gemini API key.")
+            elif "503" in msg or "UNAVAILABLE" in msg:
+                st.error("Google's Gemini servers are overloaded right now (tried backup models too). "
+                         "Please wait a minute and click Analyze again.")
             elif "429" in msg or "RESOURCE_EXHAUSTED" in msg:
                 st.error("Rate limit / quota reached. Wait a minute and try again.")
             else:
