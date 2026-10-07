@@ -1,4 +1,3 @@
-# ai-resume-assistant2
 # 📄 ATS Resume Checker
 
 A Streamlit app that scores your resume for Applicant Tracking Systems (ATS) and gives specific, actionable improvements, powered by Google Gemini Flash.
@@ -59,6 +58,14 @@ A Streamlit app that scores your resume for Applicant Tracking Systems (ATS) and
 1. Text is extracted from the uploaded file (`pypdf` / `python-docx`).
 2. The text (plus optional job description) is sent to Gemini Flash with a structured prompt that returns JSON.
 3. The app validates the JSON, clamps scores to 0-100, and computes the weighted overall score itself for consistency.
+
+## Handling "503 UNAVAILABLE / high demand" errors
+This is a temporary overload on Google's side, not a bug. The app automatically retries (waiting 2s, then 4s) and then switches to backup models.
+You can change them in `secrets.toml` / Streamlit Secrets:
+```toml
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_FALLBACK_MODELS = "gemini-2.5-flash-lite,gemini-flash-latest"
+```
 
 ## Limitations
 - Scanned or image-only PDFs can't be read (ATS systems can't read them either). Use a text-based PDF or DOCX.
